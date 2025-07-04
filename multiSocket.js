@@ -39,29 +39,24 @@ async function connectAllSockets(tokensSlice, concurrency = 20) {
   console.log(`✅ Đã kết nối ${connectedCount} socket`);
 }
 
-// Kết nối từng socket, không nhận data từ server
 function connectSocket(token, index) {
   return new Promise((resolve) => {
     const socket = io(SOCKET_URL, {
       query: { token },
       transports: ["websocket"],
+      pingTimeout: 60000,  // 60s không phản hồi mới disconnect
+      pingInterval: 5000,  // Server gửi PING mỗi 5s
     });
 
     socket.on("connect", () => {
-      // Chặn nhận data
-      const noop = () => {};
-      socket.removeAllListeners();
-      socket.on = noop;
-      socket.io.on = noop;
-      socket.io.engine.on = noop;
-      socket.io.engine.onmessage = null;
-      socket.io.engine.ondata = null;
-
-      if (socket.io.engine.transport) {
-        socket.io.engine.transport.onData = noop;
-        socket.io.engine.transport.onPacket = noop;
-        socket.io.engine.transport.onClose = noop;
-      }
+      const ignoreEvent = () => {};
+      socket.removeAllListeners();  // Xóa listener mặc định
+      
+      socket.io.engine.on("packet", (packet) => {
+        if (packet.type === "pong") {
+          return;
+        }
+      });
 
       connectedCount++;
       sockets.push(socket);
@@ -70,10 +65,7 @@ function connectSocket(token, index) {
       resolve();
     });
 
-    socket.on("disconnect", () => {
-      console.log(`❌ Socket ${index} disconnected`);
-    });
-
+    socket.on("disconnect", () => console.log(`❌ Socket ${index} disconnected`));
     socket.on("connect_error", (err) => {
       console.error(`❌ Connect error (${index}):`, err.message);
       resolve();
@@ -81,7 +73,6 @@ function connectSocket(token, index) {
   });
 }
 
-// Gửi tin tự động mỗi socket, in thống kê thay vì spam
 function startAutoChat() {
   if (!sockets.length) {
     console.log("⚠️ Chưa có socket nào được kết nối");
