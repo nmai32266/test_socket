@@ -1,148 +1,188 @@
-const io = require("socket.io-client");
-const fs = require("fs");
-const readline = require("readline");
+const axios = require('axios');
+const { io } = require('socket.io-client');
+const fs = require('fs');
+const readline = require('readline');
 
-const SOCKET_URL = "http://live-socket-lb-795224482.ap-southeast-1.elb.amazonaws.com";
-const channelId = "686270746db6db3d03d60657";
-const TOKENS_FILE = "tokens.json";
+// Configuration
+const CONFIG = {
+  BASE_URL: "https://rest-api.liverr88.xyz",
+  SOCKET_URL: "https://socket.liverr88.xyz",
+  TOKENS_FILE: "tokens.json",
+  CHANNEL_ID: "686270746db6db3d03d60657",
+  AUTO_CHAT_INTERVAL: 3000, // 3 seconds
+  MAX_CONNECTIONS: 2000, // Maximum concurrent connections
+};
 
-let sockets = [];
-let connectedCount = 0;
-let autoChat = false;
-let tokens = [];
-
-let from = 0;
-let to = 0;
-let sentSuccess = 0;
-let sentFail = 0;
-
-// Đọc token từ file
-function loadTokens() {
-  if (!fs.existsSync(TOKENS_FILE)) {
-    console.error("❌ Không tìm thấy file tokens.json");
-    process.exit(1);
-  }
-  const data = fs.readFileSync(TOKENS_FILE, "utf-8");
-  return JSON.parse(data);
-}
-
-// Kết nối nhiều socket cùng lúc theo batch
-async function connectAllSockets(tokensSlice, concurrency = 20) {
-  console.log("🔗 Đang kết nối socket...");
-  for (let i = 0; i < tokensSlice.length; i += concurrency) {
-    const batch = tokensSlice.slice(i, i + concurrency);
-    await Promise.all(
-      batch.map((token, idx) => connectSocket(token, from + i + idx))
-    );
-    await new Promise((r) => setTimeout(r, 200)); // Nghỉ giữa các batch
-  }
-  console.log(`✅ Đã kết nối ${connectedCount} socket`);
-}
-
-function connectSocket(token, index) {
-  return new Promise((resolve) => {
-    const socket = io(SOCKET_URL, {
-      query: { token },
-      transports: ["websocket"],
-      pingTimeout: 60000,  // 60s không phản hồi mới disconnect
-      pingInterval: 5000,  // Server gửi PING mỗi 5s
-    });
-
-    socket.on("connect", () => {
-      const ignoreEvent = () => {};
-      socket.removeAllListeners();  // Xóa listener mặc định
-      
-      socket.io.engine.on("packet", (packet) => {
-        if (packet.type === "pong") {
-          return;
-        }
-      });
-
-      connectedCount++;
-      sockets.push(socket);
-      socket.emit("[to_server]user_join_channel", { channelId });
-      console.log(`✅ Socket ${index} connected`);
-      resolve();
-    });
-
-    socket.on("disconnect", () => console.log(`❌ Socket ${index} disconnected`));
-    socket.on("connect_error", (err) => {
-      console.error(`❌ Connect error (${index}):`, err.message);
-      resolve();
-    });
-  });
-}
-
-function startAutoChat() {
-  if (!sockets.length) {
-    console.log("⚠️ Chưa có socket nào được kết nối");
-    return;
+class SocketConnector {
+  constructor() {
+    this.activeSockets = new Map();
+    this.connectionCount = 0;
+    this.autoChatEnabled = false;
   }
 
-  autoChat = true;
-  console.log("🚀 Bắt đầu auto chat...");
-
-  sockets.forEach((socket, index) => {
-    const delay = 3200 + Math.floor(Math.random() * 1000);
-    setInterval(() => {
-      if (autoChat) {
-        try {
-          socket.emit("[to_server]user_send_message", {
-            channelId,
-            content: `💬 User ${index} ${new Date().toLocaleTimeString()}`,
-          });
-          sentSuccess++;
-        } catch (err) {
-          sentFail++;
-        }
-      }
-    }, delay);
-  });
-
-  // Hiển thị tổng số đã gửi mỗi 5s
-  setInterval(() => {
-    if (autoChat) {
-      console.log(`📨 Đã gửi: ${sentSuccess} thành công, ${sentFail} lỗi`);
+  async start() {
+    // Load tokens from file
+    const tokens = await this.loadTokens();
+    if (!tokens || tokens.length === 0) {
+      console.error("No tokens found in tokens.json");
+      process.exit(1);
     }
-  }, 5000);
-}
 
-// Giao diện CLI
-async function main() {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
+    // Get user input for range
+    const { start, end } = await this.getUserInput(tokens.length);
 
-  tokens = loadTokens();
+    // Validate range
+    if (start < 1 || end > tokens.length || start > end) {
+      console.error("Invalid range specified");
+      process.exit(1);
+    }
 
-  rl.question("Nhập số bắt đầu (from): ", (fromInput) => {
-    from = parseInt(fromInput);
-    rl.question("Nhập số kết thúc (to): ", (toInput) => {
-      to = parseInt(toInput);
-      const tokenSubset = tokens.slice(from, to + 1);
-      console.log(`✅ Chọn ${tokenSubset.length} token từ ${from} đến ${to}`);
-      showMenu();
+    // Ask about auto-chat
+    this.autoChatEnabled = await this.askAutoChat();
 
-      rl.on("line", async (input) => {
-        if (input.trim() === "1") {
-          await connectAllSockets(tokenSubset);
-        } else if (input.trim() === "2") {
-          startAutoChat();
-        } else {
-          console.log("⚠️ Lệnh không hợp lệ");
-        }
-        showMenu();
+    // Connect sockets
+    console.log(`Connecting sockets from ${start} to ${end}...`);
+    await this.connectSockets(tokens.slice(start - 1, end));
+
+    // Start status monitoring
+    this.startStatusMonitor();
+
+    console.log("All connections initiated. Press Ctrl+C to exit.");
+  }
+
+  async loadTokens() {
+    try {
+      const data = fs.readFileSync(CONFIG.TOKENS_FILE, 'utf8');
+      return JSON.parse(data);
+    } catch (err) {
+      console.error(`Error loading tokens file: ${err.message}`);
+      return null;
+    }
+  }
+
+  async getUserInput(maxTokens) {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+
+    return new Promise((resolve) => {
+      rl.question(`Enter start (1-${maxTokens}): `, (start) => {
+        rl.question(`Enter end (${start}-${maxTokens}): `, (end) => {
+          rl.close();
+          resolve({
+            start: parseInt(start),
+            end: parseInt(end)
+          });
+        });
       });
     });
-  });
+  }
+
+  async askAutoChat() {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+
+    return new Promise((resolve) => {
+      rl.question('Enable auto-chat? (y/n): ', (answer) => {
+        rl.close();
+        resolve(answer.toLowerCase() === 'y');
+      });
+    });
+  }
+
+  async connectSockets(tokens) {
+    const connectionPromises = [];
+    
+    for (let i = 0; i < tokens.length; i++) {
+      if (this.connectionCount >= CONFIG.MAX_CONNECTIONS) {
+        // Wait for some connections to complete before continuing
+        await Promise.race(connectionPromises);
+      }
+
+      const token = tokens[i];
+      const promise = this.connectSocket(token, i + 1);
+      connectionPromises.push(promise);
+    }
+
+    await Promise.all(connectionPromises);
+  }
+
+  async connectSocket(token, index) {
+    return new Promise((resolve) => {
+      const socket = io(CONFIG.SOCKET_URL, {
+        query: { token, wsUserId: "" },
+        transports: ["websocket"],
+        reconnection: true,
+        reconnectionAttempts: Infinity,
+        reconnectionDelay: 1000,
+        reconnectionDelayMax: 5000,
+        randomizationFactor: 0.5
+      });
+
+      socket.on('connect', () => {
+        this.connectionCount++;
+        this.activeSockets.set(index, socket);
+        
+        console.log(`Socket ${index} connected`);
+        socket.emit("to_server::user_join_channel", {
+          channelId: CONFIG.CHANNEL_ID
+        });
+
+        if (this.autoChatEnabled) {
+          this.setupAutoChat(socket, index);
+        }
+
+        resolve();
+      });
+
+      socket.on('disconnect', () => {
+        this.connectionCount--;
+        this.activeSockets.delete(index);
+        console.log(`Socket ${index} disconnected`);
+      });
+
+      socket.on('connect_error', (err) => {
+        console.error(`Socket ${index} connection error:`, err.message);
+      });
+
+      socket.connect();
+    });
+  }
+
+  setupAutoChat(socket, index) {
+    const sendMessage = () => {
+      if (socket.connected) {
+        socket.emit("to_server::user_send_message", {
+          channelId: CONFIG.CHANNEL_ID,
+          content: `${index} - ${new Date().toISOString()}`
+        });
+      }
+      
+      // Schedule next message with some randomness
+      const delay = CONFIG.AUTO_CHAT_INTERVAL + Math.random() * 2000;
+      setTimeout(sendMessage, delay);
+    };
+
+    // Start the auto-chat loop
+    setTimeout(sendMessage, Math.random() * 5000);
+  }
+
+  startStatusMonitor() {
+    setInterval(() => {
+      console.log(`Active connections: ${this.connectionCount}`);
+    }, 5000);
+  }
 }
 
-function showMenu() {
-  console.log("\nChọn lệnh:");
-  console.log("1. Kết nối socket");
-  console.log("2. Bắt đầu chat tự động");
-  console.log("Ctrl+C để thoát");
-}
+// Run the connector
+const connector = new SocketConnector();
+connector.start().catch(console.error);
 
-main();
+// Handle process termination
+process.on('SIGINT', () => {
+  console.log("\nDisconnecting all sockets...");
+  process.exit();
+});
